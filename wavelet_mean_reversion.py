@@ -63,6 +63,8 @@ PARAMETER TUNING RATIONALE  (v2, based on v1 diagnostic results)
       a gradual bleed on setups that drift sideways or continue lower.
 """
 
+import sys
+import os
 import numpy as np
 import pandas as pd
 import pywt
@@ -139,18 +141,129 @@ def generate_synthetic_data(
     )
 
 
+def load_csv(csv_path: str) -> pd.DataFrame:
+    """
+    Load OHLCV data from a CSV file.
+
+    Handles the most common formats automatically:
+
+      Yahoo Finance export
+        Date, Open, High, Low, Close, Adj Close, Volume
+        (Adj Close is used as Close when present)
+
+      Generic / broker export
+        Any capitalisation of: date, open, high, low, close, volume
+        Date column can be named: Date, date, Datetime, datetime, Time, time
+
+      Multi-level column headers (e.g. from yfinance DataFrame.to_csv())
+        Flattened automatically.
+
+    The returned DataFrame always has:
+      - Columns : Open, High, Low, Close, Volume  (Title case)
+      - Index   : DatetimeIndex (ascending, no duplicates)
+
+    Raises ValueError with a clear message if required columns are missing
+    or the file has fewer than 200 rows after cleaning.
+    """
+    # ── Read raw CSV ──────────────────────────────────────────────────────
+    try:
+        raw = pd.read_csv(csv_path, header=0)
+    except Exception as exc:
+        raise ValueError(f"Cannot read CSV '{csv_path}': {exc}")
+
+    # Flatten multi-level column headers (e.g. "('Close', 'AAPL')" → "Close")
+    raw.columns = [
+        str(c).split(",")[0].strip("(' )") if "," in str(c) else str(c).strip()
+        for c in raw.columns
+    ]
+
+    # ── Normalise column names to Title Case ─────────────────────────────
+    col_map: dict = {}
+    for col in raw.columns:
+        lc = col.lower().strip()
+        if lc in ("date", "datetime", "time", "timestamp"):
+            col_map[col] = "_date"
+        elif lc in ("open",):
+            col_map[col] = "Open"
+        elif lc in ("high",):
+            col_map[col] = "High"
+        elif lc in ("low",):
+            col_map[col] = "Low"
+        elif lc in ("adj close", "adj_close", "adjclose", "adjusted_close",
+                    "adjusted close"):
+            col_map[col] = "Close"          # prefer adjusted price
+        elif lc in ("close",) and "Close" not in col_map.values():
+            col_map[col] = "Close"          # fallback if no adj close
+        elif lc in ("volume", "vol"):
+            col_map[col] = "Volume"
+
+    raw = raw.rename(columns=col_map)
+
+    # De-duplicate columns that both mapped to "Close" (e.g. Close + Adj Close).
+    # keep='last' retains the rightmost occurrence — Adj Close always appears
+    # after Close in a Yahoo Finance export, so it wins the de-dup.
+    raw = raw.loc[:, ~raw.columns.duplicated(keep="last")]
+
+    # ── Set DatetimeIndex ─────────────────────────────────────────────────
+    if "_date" not in raw.columns:
+        # Some files use the first column as an unnamed date index
+        raw = raw.rename(columns={raw.columns[0]: "_date"})
+
+    raw["_date"] = pd.to_datetime(raw["_date"])   # auto-infers format
+    raw = raw.set_index("_date").sort_index()
+    raw.index.name = "Date"
+
+    # ── Keep required columns ─────────────────────────────────────────────
+    required = ["Open", "High", "Low", "Close"]
+    missing  = [c for c in required if c not in raw.columns]
+    if missing:
+        raise ValueError(
+            f"CSV '{csv_path}' is missing required columns: {missing}\n"
+            f"  Detected columns: {list(raw.columns)}\n"
+            f"  Expected (case-insensitive): Open, High, Low, Close[, Volume, Date]"
+        )
+
+    if "Volume" not in raw.columns:
+        raw["Volume"] = 0.0   # volume is optional; fill with zeros if absent
+
+    df = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
+    df = df.apply(pd.to_numeric, errors="coerce").dropna(subset=required)
+    df = df[~df.index.duplicated(keep="last")]
+
+    if len(df) < 200:
+        raise ValueError(
+            f"CSV '{csv_path}' has only {len(df)} clean rows after parsing. "
+            f"At least 200 are required for a meaningful backtest."
+        )
+
+    return df
+
+
 def load_data(
+    csv_path: Optional[str] = None,
     ticker: str = "SPY",
     start: str  = "2015-01-01",
     end: str    = "2024-12-31",
 ) -> pd.DataFrame:
     """
-    Load OHLCV data from yfinance; fall back to synthetic data if unavailable.
+    Load OHLCV data from one of three sources (in priority order):
 
-    In production, replace this with your preferred data provider.
-    The rest of the system is data-source agnostic — it only requires a
+      1. Local CSV file  — if csv_path is provided
+      2. yfinance        — if yfinance is installed
+      3. Synthetic data  — fallback for testing/development
+
+    The rest of the system is data-source agnostic: it only requires a
     DataFrame with columns [Open, High, Low, Close, Volume] and a DatetimeIndex.
     """
+    # ── Priority 1: user-supplied CSV ────────────────────────────────────
+    if csv_path is not None:
+        df = load_csv(csv_path)
+        name = csv_path.split("/")[-1]
+        print(f"    Loaded {len(df)} bars from CSV  ({name})")
+        print(f"    Date range: {df.index[0].date()} → {df.index[-1].date()}")
+        return df
+
+    # ── Priority 2: yfinance ─────────────────────────────────────────────
     try:
         import yfinance as yf
         df = yf.download(ticker, start=start, end=end, auto_adjust=True, progress=False)
@@ -161,9 +274,11 @@ def load_data(
         return df
     except Exception as exc:
         print(f"    yfinance unavailable ({exc}). Falling back to synthetic data.")
-        df = generate_synthetic_data()
-        print(f"    Generated {len(df)} bars of synthetic OHLCV data.")
-        return df
+
+    # ── Priority 3: synthetic ────────────────────────────────────────────
+    df = generate_synthetic_data()
+    print(f"    Generated {len(df)} bars of synthetic OHLCV data.")
+    return df
 
 
 # ============================================================
@@ -892,14 +1007,14 @@ class BacktestEngine:
             # filter (close[t] > open[t]).  Both prices are observed by end of
             # bar t — strictly causal.
             pending_signal = signal_generator.generate(
-                price            = current_close,
-                rsi              = rsi,
-                middle_band      = middle,
-                upper_band       = upper,
-                lower_band       = lower,
+                price            = float(current_close),
+                rsi              = float(rsi),
+                middle_band      = float(middle),
+                upper_band       = float(upper),
+                lower_band       = float(lower),
                 regime           = regime,
                 current_position = state.position,
-                open_price       = opens_arr[t],  # current bar open — causal
+                open_price       = float(opens_arr[t]),  # current bar open — causal
             )
 
             # Diagnostic log (useful for auditing no-lookahead compliance)
@@ -1101,7 +1216,8 @@ def print_trade_log(state: BacktestState, n_tail: int = 15) -> None:
 def plot_results(
     state: BacktestState,
     metrics: dict,
-    save_path: str = "wavelet_strategy_results.png",
+    save_path: str    = "wavelet_strategy_results.png",
+    title_label: str  = "",
 ) -> None:
     """
     Produce a 4-panel diagnostic chart:
@@ -1125,8 +1241,9 @@ def plot_results(
     dd_pct = (equity - peak) / peak * 100.0
 
     fig = plt.figure(figsize=(16, 12))
+    suffix = f" — {title_label}" if title_label else ""
     fig.suptitle(
-        "Wavelet Mean Reversion Strategy — Walk-Forward Backtest (v2)",
+        f"Wavelet Mean Reversion Strategy — Walk-Forward Backtest (v2){suffix}",
         fontsize=13, fontweight="bold", y=0.98,
     )
     gs = gridspec.GridSpec(3, 2, figure=fig, hspace=0.45, wspace=0.35)
@@ -1204,9 +1321,40 @@ def plot_results(
 # ============================================================
 
 def main():
+    # ── CLI argument parsing ──────────────────────────────────────────────
+    # Usage:
+    #   python3 wavelet_mean_reversion.py                    # synthetic data
+    #   python3 wavelet_mean_reversion.py AAPL.csv           # local CSV
+    #   python3 wavelet_mean_reversion.py path/to/TSLA.csv   # full path
+    #
+    # The CSV must contain at minimum: Date, Open, High, Low, Close columns.
+    # Volume is optional.  Column names are case-insensitive.
+    # Yahoo Finance, generic broker exports, and most OHLCV formats are
+    # detected automatically — see load_csv() for details.
+    csv_path = None
+    if len(sys.argv) > 1:
+        arg = sys.argv[1]
+        if arg.lower().endswith(".csv"):
+            if not os.path.isfile(arg):
+                print(f"ERROR: CSV file not found: '{arg}'")
+                sys.exit(1)
+            csv_path = arg
+        else:
+            print(f"ERROR: Unrecognised argument '{arg}'.")
+            print("Usage: python3 wavelet_mean_reversion.py [path/to/data.csv]")
+            sys.exit(1)
+
+    # Derive a display name for the chart title
+    data_label = (
+        os.path.splitext(os.path.basename(csv_path))[0].upper()
+        if csv_path else "SYNTHETIC"
+    )
+    chart_file = f"wavelet_results_{data_label.lower()}.png"
+
     print("=" * 70)
     print("  REGIME-AWARE WAVELET MEAN REVERSION — WALK-FORWARD BACKTEST  v2")
     print("=" * 70)
+    print(f"  Data source : {csv_path if csv_path else 'synthetic (no CSV supplied)'}")
     print("""
   v2 parameter changes vs v1
   ──────────────────────────
@@ -1215,11 +1363,12 @@ def main():
   min_bb_distance   (new) → 0.3%   (no entries at the band edge)
   rsi_overbought    70    → 65     (take profit earlier on the bounce)
   max_bars_held     (new) → 20     (time-based stop for stale setups)
+  bullish_candle    (new)          (close[t] > open[t] confirmation)
 """)
 
     # ── 1. Load data ─────────────────────────────────────────────────────
     print("[1/5] Loading market data ...")
-    df = load_data(ticker="SPY", start="2015-01-01", end="2024-12-31")
+    df = load_data(csv_path=csv_path, ticker="SPY", start="2015-01-01", end="2024-12-31")
 
     # ── 2. Instantiate modules ────────────────────────────────────────────
     print("[2/5] Initialising modules ...")
@@ -1281,7 +1430,7 @@ def main():
     print_trade_log(state, n_tail=20)
 
     print("\n[5/5] Generating charts ...")
-    plot_results(state, metrics, save_path="wavelet_strategy_results.png")
+    plot_results(state, metrics, save_path=chart_file, title_label=data_label)
 
     print("\nDone.")
     return state, metrics
